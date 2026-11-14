@@ -50,3 +50,8 @@ Raw Server Logs (.log)
 │  4. Structured Reporting & Audit Export │  ──► security_audit_report.json
 │     (src/reporter.py)                   │      detected_anomalies.csv
 └─────────────────────────────────────────┘
+---
+
+## Detailed Documentation
+
+See the **[User & Developer Technical Guide](docs/USER_AND_DEVELOPER_GUIDE.md)** for architecture diagrams, CLI workflows, and extension guides.
