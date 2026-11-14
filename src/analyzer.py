@@ -1,20 +1,41 @@
 """
 Module: analyzer.py
-Purpose: Performs time-series aggregation and statistical anomaly detection over structured
-         HTTP access logs to identify volumetric spikes and targeted attack patterns.
-
-Architectural Rationale:
-    Pure threshold rules (e.g., "flag > 100 requests") fail across environments with varying
-    baseline traffic volumes. Conversely, pure statistical outliers miss low-volume targeted
-    attacks (such as slow credential stuffing). Therefore, this engine combines two layers:
-      1. Statistical Z-Score Detection: Measures how many standard deviations a client's
-         request volume deviates from the cohort mean within a tumbling time window.
-      2. Behavioral Heuristic Scoring: Evaluates authentication error rates (HTTP 401),
-         resource probing rates (HTTP 403/404), and endpoint diversity to classify the
-         exact threat vector.
+Purpose: Performs time-series aggregation and hybrid anomaly detection (statistical Z-Score
+         combined with behavioral HTTP error heuristics) on pseudonymized web access logs.
 """
 
+import numpy as np
 import pandas as pd
+
+
+def _classify_incident(row: pd.Series) -> str:
+    """Classify a flagged anomalous client-window into an actionable security threat category."""
+    total_reqs: float = float(row["request_count"])
+    if total_reqs <= 0:
+        return "VOLUMETRIC_TRAFFIC_SPIKE"
+
+    if row["auth_errors"] >= 5 and (row["auth_errors"] / total_reqs) >= 0.5:
+        return "CREDENTIAL_BRUTE_FORCE"
+
+    if row["rate_limit_errors"] >= 5 and (row["rate_limit_errors"] / total_reqs) >= 0.5:
+        return "RATE_LIMIT_ABUSE"
+
+    if row["recon_errors"] >= 5 and (row["recon_errors"] / total_reqs) >= 0.5:
+        return "DIRECTORY_ENUMERATION"
+
+    return "VOLUMETRIC_TRAFFIC_SPIKE"
+
+
+def _assign_severity(row: pd.Series) -> str:
+    """Determine incident severity level ('HIGH' or 'MEDIUM') from statistical and error signals."""
+    if (
+        row["z_score"] >= 5.0
+        or row["error_ratio"] >= 0.8
+        or row["request_count"] >= 50
+        or row["rate_limit_errors"] >= 15
+    ):
+        return "HIGH"
+    return "MEDIUM"
 
 
 def analyze_traffic_anomalies(
@@ -23,42 +44,42 @@ def analyze_traffic_anomalies(
     z_threshold: float = 3.0,
     error_ratio_threshold: float = 0.65,
     min_requests_for_error_alert: int = 10,
+    min_rate_limit_errors: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Aggregate traffic into tumbling time windows per client and isolate anomalous behavior.
+    """Aggregate pseudonymized log events into discrete time windows and detect anomalous clients."""
+    expected_columns = [
+        "timestamp",
+        "client_id",
+        "request_count",
+        "auth_errors",
+        "recon_errors",
+        "rate_limit_errors",
+        "total_errors",
+        "unique_endpoints",
+        "total_bytes",
+        "z_score",
+        "error_ratio",
+        "threat_classification",
+        "severity",
+    ]
 
-    Args:
-        df (pd.DataFrame): Clean, pseudonymized access log DataFrame from parser.py.
-        window (str): Pandas frequency alias defining the aggregation bucket (e.g., '1min', '5min').
-        z_threshold (float): Minimum Z-Score required to classify a volume burst as anomalous.
-        error_ratio_threshold (float): Minimum ratio of HTTP 401/403/404 errors (0.0 to 1.0)
-                                       to trigger a behavioral intrusion alert.
-        min_requests_for_error_alert (int): Minimum request floor preventing false positives from
-                                            a single user mistyping a URL once (1/1 = 100% error).
-
-    Returns:
-        tuple[pd.DataFrame, pd.DataFrame]:
-            - window_metrics: Complete aggregated time-series metrics for all clients.
-            - detected_anomalies: Filtered subset of windows flagged as security incidents.
-    """
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        empty_df = pd.DataFrame(columns=expected_columns)
+        return empty_df, empty_df.copy()
 
     working_df = df.copy()
+    working_df["is_auth_error"] = working_df["status"].isin([401, 403]).astype("int32")
+    working_df["is_recon_error"] = working_df["status"].isin([404, 405]).astype("int32")
+    working_df["is_rate_limit_error"] = (working_df["status"] == 429).astype("int32")
+    working_df["is_any_error"] = (working_df["status"] >= 400).astype("int32")
 
-    # Create binary indicator columns for vectorized group aggregation
-    working_df["is_auth_error"] = (working_df["status"] == 401).astype(int)
-    working_df["is_recon_error"] = working_df["status"].isin([403, 404]).astype(int)
-    working_df["is_any_error"] = working_df["status"].isin([401, 403, 404]).astype(int)
-
-    # Group events by tumbling time window and pseudonymized client identifier
-    window_metrics: pd.DataFrame = (
-        working_df.set_index("timestamp")
-        .groupby([pd.Grouper(freq=window), "client_id"])
+    grouped = (
+        working_df.groupby([pd.Grouper(key="timestamp", freq=window), "client_id"], observed=True)
         .agg(
             request_count=("status", "count"),
             auth_errors=("is_auth_error", "sum"),
             recon_errors=("is_recon_error", "sum"),
+            rate_limit_errors=("is_rate_limit_error", "sum"),
             total_errors=("is_any_error", "sum"),
             unique_endpoints=("endpoint", "nunique"),
             total_bytes=("bytes", "sum"),
@@ -66,70 +87,47 @@ def analyze_traffic_anomalies(
         .reset_index()
     )
 
-    if window_metrics.empty:
-        return window_metrics, pd.DataFrame()
+    mean_requests: float = float(grouped["request_count"].mean())
+    std_requests: float = float(grouped["request_count"].std(ddof=0))
 
-    # Calculate cohort-wide mean and population standard deviation (ddof=0)
-    mean_requests: float = float(window_metrics["request_count"].mean())
-    std_requests: float = float(window_metrics["request_count"].std(ddof=0))
-
-    # Guard against division by zero when all clients exhibit identical request counts
-    if std_requests == 0.0:
-        window_metrics["z_score"] = 0.0
+    if std_requests > 0.0:
+        grouped["z_score"] = ((grouped["request_count"] - mean_requests) / std_requests).round(3)
     else:
-        window_metrics["z_score"] = (
-            (window_metrics["request_count"] - mean_requests) / std_requests
-        ).round(3)
+        grouped["z_score"] = 0.0
 
-    # Compute proportion of failed HTTP responses per client window
-    window_metrics["error_ratio"] = (
-        window_metrics["total_errors"] / window_metrics["request_count"]
-    ).round(3)
-
-    # Evaluate statistical and behavioral detection conditions
-    is_volume_spike = window_metrics["z_score"] >= z_threshold
-    is_high_error_burst = (window_metrics["error_ratio"] >= error_ratio_threshold) & (
-        window_metrics["request_count"] >= min_requests_for_error_alert
+    grouped["error_ratio"] = np.where(
+        grouped["request_count"] > 0,
+        (grouped["total_errors"] / grouped["request_count"]).round(3),
+        0.0,
     )
 
-    detected_anomalies = window_metrics[is_volume_spike | is_high_error_burst].copy()
+    volumetric_mask = grouped["z_score"] >= z_threshold
+    behavioral_error_mask = (grouped["request_count"] >= min_requests_for_error_alert) & (
+        grouped["error_ratio"] >= error_ratio_threshold
+    )
+    rate_limit_mask = (grouped["rate_limit_errors"] >= min_rate_limit_errors) & (
+        (grouped["rate_limit_errors"] / grouped["request_count"]) >= 0.5
+    )
 
-    if not detected_anomalies.empty:
-        detected_anomalies["threat_classification"] = detected_anomalies.apply(
-            _classify_incident, axis=1
-        )
-        detected_anomalies["severity"] = detected_anomalies.apply(
-            _assign_severity, axis=1
-        )
-        detected_anomalies = detected_anomalies.sort_values(
-            by=["z_score", "error_ratio"], ascending=[False, False]
-        ).reset_index(drop=True)
+    anomaly_mask = volumetric_mask | behavioral_error_mask | rate_limit_mask
+    anomalies = grouped[anomaly_mask].copy()
 
-    return window_metrics, detected_anomalies
+    if anomalies.empty:
+        grouped["threat_classification"] = "NORMAL"
+        grouped["severity"] = "NONE"
+        empty_anomalies = pd.DataFrame(columns=expected_columns)
+        return grouped, empty_anomalies
 
+    anomalies["threat_classification"] = anomalies.apply(_classify_incident, axis=1)
+    anomalies["severity"] = anomalies.apply(_assign_severity, axis=1)
 
-def _classify_incident(row: pd.Series) -> str:
-    if row["auth_errors"] >= 5 and (row["auth_errors"] / row["request_count"]) >= 0.5:
-        return "CREDENTIAL_BRUTE_FORCE"
-    if row["recon_errors"] >= 5 and (row["recon_errors"] / row["request_count"]) >= 0.5:
-        return "DIRECTORY_ENUMERATION"
+    grouped["threat_classification"] = "NORMAL"
+    grouped["severity"] = "NONE"
+    grouped.loc[anomaly_mask, "threat_classification"] = anomalies["threat_classification"]
+    grouped.loc[anomaly_mask, "severity"] = anomalies["severity"]
 
-    # مثال لإضافة تصنيف جديد:
-    if row["request_count"] >= 200:
-        return "CRITICAL_DDOS_FLOOD"
-    return "VOLUMETRIC_TRAFFIC_SPIKE"
+    anomalies = anomalies.sort_values(
+        by=["z_score", "rate_limit_errors"], ascending=False
+    ).reset_index(drop=True)
 
-
-def _assign_severity(row: pd.Series) -> str:
-    """
-    Compute operational triage severity ('HIGH' vs. 'MEDIUM') for SOC or BI alerting.
-
-    Args:
-        row (pd.Series): A single aggregated row from the detected_anomalies DataFrame.
-
-    Returns:
-        str: Severity level string.
-    """
-    if row["z_score"] >= 5.0 or row["request_count"] >= 50:
-        return "HIGH"
-    return "MEDIUM"
+    return grouped, anomalies
