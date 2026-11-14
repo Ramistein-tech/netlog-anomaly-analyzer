@@ -109,24 +109,14 @@ def analyze_traffic_anomalies(
 
 
 def _classify_incident(row: pd.Series) -> str:
-    """
-    Assign a semantic security category to an anomalous client window based on error signatures.
-
-    Args:
-        row (pd.Series): A single aggregated row from the detected_anomalies DataFrame.
-
-    Returns:
-        str: Classification label ('CREDENTIAL_BRUTE_FORCE', 'DIRECTORY_ENUMERATION',
-             or 'VOLUMETRIC_TRAFFIC_SPIKE').
-    """
-    # Predominantly HTTP 401 responses indicate automated password guessing
     if row["auth_errors"] >= 5 and (row["auth_errors"] / row["request_count"]) >= 0.5:
         return "CREDENTIAL_BRUTE_FORCE"
-
-    # Predominantly HTTP 403/404 across distinct paths indicates automated directory probing
     if row["recon_errors"] >= 5 and (row["recon_errors"] / row["request_count"]) >= 0.5:
         return "DIRECTORY_ENUMERATION"
 
+    # مثال لإضافة تصنيف جديد:
+    if row["request_count"] >= 200:
+        return "CRITICAL_DDOS_FLOOD"
     return "VOLUMETRIC_TRAFFIC_SPIKE"
 
 
